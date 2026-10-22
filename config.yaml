@@ -18,6 +18,12 @@ routing:
       min_prompt_tokens: 3000
       prefer: [mock-premium/premium-large]
 
+retry:                      # per candidate in the fallback chain
+  max_attempts: 3           # first try included
+  base_delay: 100ms         # backoff: random in [0, min(max_delay, base_delay * 2^(n-1)))
+  max_delay: 2s
+  max_retry_after: 5s       # a longer Retry-After means fall back instead of waiting
+
 # Prices are made-up values for the mocks, in USD per 1K tokens.
 providers:
   - name: mock-cheap

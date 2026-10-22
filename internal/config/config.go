@@ -16,7 +16,16 @@ import (
 type Config struct {
 	Server    Server     `yaml:"server"`
 	Routing   Routing    `yaml:"routing"`
+	Retry     Retry      `yaml:"retry"`
 	Providers []Provider `yaml:"providers"`
+}
+
+// Retry applies to each candidate in the fallback chain separately.
+type Retry struct {
+	MaxAttempts   int           `yaml:"max_attempts"` // per candidate, first try included
+	BaseDelay     time.Duration `yaml:"base_delay"`
+	MaxDelay      time.Duration `yaml:"max_delay"`
+	MaxRetryAfter time.Duration `yaml:"max_retry_after"` // longer Retry-After means fall back instead of waiting
 }
 
 type Routing struct {
@@ -104,6 +113,18 @@ func (c *Config) applyDefaults() {
 	}
 	if c.Routing.LatencyWindow == 0 {
 		c.Routing.LatencyWindow = 100
+	}
+	if c.Retry.MaxAttempts == 0 {
+		c.Retry.MaxAttempts = 3
+	}
+	if c.Retry.BaseDelay == 0 {
+		c.Retry.BaseDelay = 100 * time.Millisecond
+	}
+	if c.Retry.MaxDelay == 0 {
+		c.Retry.MaxDelay = 2 * time.Second
+	}
+	if c.Retry.MaxRetryAfter == 0 {
+		c.Retry.MaxRetryAfter = 5 * time.Second
 	}
 	for i := range c.Providers {
 		if c.Providers[i].AttemptTimeout == 0 {

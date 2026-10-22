@@ -39,7 +39,7 @@ func run(configPath string, log *slog.Logger) error {
 	if err != nil {
 		return err
 	}
-	rt, err := router.New(candidates, cfg.Routing, log)
+	rt, err := router.New(candidates, router.Options{Routing: cfg.Routing, Retry: cfg.Retry, Logger: log})
 	if err != nil {
 		return err
 	}
@@ -90,7 +90,7 @@ func buildCandidates(cfg *config.Config) ([]router.Candidate, error) {
 			return nil, fmt.Errorf("provider %q: unknown type %q", pc.Name, pc.Type)
 		}
 		for _, m := range pc.Models {
-			out = append(out, router.Candidate{Provider: p, Model: m})
+			out = append(out, router.Candidate{Provider: p, Model: m, Timeout: pc.AttemptTimeout})
 		}
 	}
 	return out, nil

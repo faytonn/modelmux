@@ -99,7 +99,7 @@ func TestFittingDropsSmallContextWindows(t *testing.T) {
 }
 
 func TestRouterHintOverridesDefaultPolicy(t *testing.T) {
-	r, err := New(testCands, config.Routing{Policy: "cost", LatencyWindow: 10}, discardLogger())
+	r, err := New(testCands, Options{Routing: config.Routing{Policy: "cost", LatencyWindow: 10}, Logger: discardLogger()})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -123,7 +123,7 @@ func TestRouterHintOverridesDefaultPolicy(t *testing.T) {
 }
 
 func TestRouterRejectsPromptLargerThanEveryModel(t *testing.T) {
-	r, err := New(testCands, config.Routing{Policy: "cost", LatencyWindow: 10}, discardLogger())
+	r, err := New(testCands, Options{Routing: config.Routing{Policy: "cost", LatencyWindow: 10}, Logger: discardLogger()})
 	if err != nil {
 		t.Fatal(err)
 	}
