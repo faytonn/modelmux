@@ -7,9 +7,11 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"net/http"
 	"time"
 
 	"github.com/faytonn/modelmux/internal/config"
+	"github.com/faytonn/modelmux/internal/metrics"
 	"github.com/faytonn/modelmux/internal/providers"
 	"github.com/faytonn/modelmux/internal/resilience"
 )
@@ -62,6 +64,7 @@ type Options struct {
 	Routing config.Routing
 	Retry   config.Retry
 	Breaker config.Breaker
+	Metrics *metrics.Metrics // may be nil
 	Logger  *slog.Logger
 }
 
@@ -75,6 +78,7 @@ type Router struct {
 	latency       *LatencyTracker
 	retry         resilience.RetryPolicy
 	breakers      map[string]*resilience.Breaker // one per provider
+	metrics       *metrics.Metrics
 	log           *slog.Logger
 }
 
@@ -98,8 +102,10 @@ func New(candidates []Candidate, opts Options) (*Router, error) {
 		}
 		breakers[name] = resilience.NewBreaker(opts.Breaker.FailureThreshold, opts.Breaker.OpenTimeout,
 			func(from, to resilience.State) {
+				opts.Metrics.SetBreakerState(name, int(to))
 				opts.Logger.Warn("circuit breaker state change", "provider", name, "from", from.String(), "to", to.String())
 			})
+		opts.Metrics.SetBreakerState(name, int(resilience.Closed))
 	}
 
 	return &Router{
@@ -115,6 +121,7 @@ func New(candidates []Candidate, opts Options) (*Router, error) {
 			Classify:      providers.Classify,
 		},
 		breakers: breakers,
+		metrics:  opts.Metrics,
 		log:      opts.Logger,
 	}, nil
 }
@@ -146,6 +153,7 @@ func (r *Router) Chat(ctx context.Context, req Request) (*Result, error) {
 		if err == nil {
 			res.Provider, res.Model, res.Response = c.Provider.Name(), c.Model.Name, resp
 			res.CostUSD = c.Model.Cost(resp.InputTokens, resp.OutputTokens)
+			r.metrics.ObserveUsage(c.Provider.Name(), c.Model.Name, resp.InputTokens, resp.OutputTokens, res.CostUSD)
 			return res, nil
 		}
 		lastErr = err
@@ -153,6 +161,7 @@ func (r *Router) Chat(ctx context.Context, req Request) (*Result, error) {
 			return res, fmt.Errorf("request budget exhausted: %w", ctx.Err())
 		}
 		if i < len(ranked)-1 {
+			r.metrics.ObserveFallback(c.Provider.Name(), c.Model.Name)
 			r.log.WarnContext(ctx, "candidate failed, falling back",
 				"failed", c.Key(), "next", ranked[i+1].Key(), "error", err)
 		}
@@ -166,6 +175,7 @@ func (r *Router) Chat(ctx context.Context, req Request) (*Result, error) {
 func (r *Router) tryCandidate(ctx context.Context, c Candidate, req Request, res *Result) (*providers.Response, error) {
 	retry := r.retry
 	retry.OnRetry = func(attempt int, err error, delay time.Duration) {
+		r.metrics.ObserveRetry(c.Provider.Name(), c.Model.Name)
 		r.log.InfoContext(ctx, "retrying", "candidate", c.Key(), "attempt", attempt, "delay", delay, "error", err)
 	}
 	breaker := r.breakers[c.Provider.Name()]
@@ -177,6 +187,7 @@ func (r *Router) tryCandidate(ctx context.Context, c Candidate, req Request, res
 			err := fmt.Errorf("%s: %w", c.Provider.Name(), resilience.ErrOpen)
 			a.Error = err.Error()
 			res.Attempts = append(res.Attempts, a)
+			r.metrics.ObserveAttempt(c.Provider.Name(), c.Model.Name, metrics.OutcomeBreakerOpen, 0)
 			return nil, err
 		}
 
@@ -207,6 +218,23 @@ func (r *Router) tryCandidate(ctx context.Context, c Candidate, req Request, res
 			a.Error = err.Error()
 		}
 		res.Attempts = append(res.Attempts, a)
+		r.metrics.ObserveAttempt(c.Provider.Name(), c.Model.Name, outcome(err), elapsed)
 		return resp, err
 	})
+}
+
+// outcome maps an attempt's error to the metrics "outcome" label.
+func outcome(err error) string {
+	var pe *providers.Error
+	switch {
+	case err == nil:
+		return metrics.OutcomeSuccess
+	case errors.As(err, &pe) && pe.StatusCode == http.StatusTooManyRequests:
+		return metrics.OutcomeRateLimited
+	case errors.Is(err, context.DeadlineExceeded):
+		return metrics.OutcomeTimeout
+	case errors.Is(err, context.Canceled):
+		return metrics.OutcomeCanceled
+	}
+	return metrics.OutcomeError
 }

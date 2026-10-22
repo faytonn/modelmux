@@ -13,7 +13,12 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/promhttp"
+
 	"github.com/faytonn/modelmux/internal/config"
+	"github.com/faytonn/modelmux/internal/logging"
+	"github.com/faytonn/modelmux/internal/metrics"
 	"github.com/faytonn/modelmux/internal/providers"
 	"github.com/faytonn/modelmux/internal/router"
 	"github.com/faytonn/modelmux/internal/server"
@@ -21,9 +26,14 @@ import (
 
 func main() {
 	configPath := flag.String("config", "config.yaml", "path to the YAML config file")
+	logFormat := flag.String("log-format", "json", "log format: json or text")
 	flag.Parse()
 
-	log := slog.New(slog.NewTextHandler(os.Stdout, nil))
+	var base slog.Handler = slog.NewJSONHandler(os.Stdout, nil)
+	if *logFormat == "text" {
+		base = slog.NewTextHandler(os.Stdout, nil)
+	}
+	log := slog.New(logging.Handler{Handler: base})
 	if err := run(*configPath, log); err != nil {
 		log.Error("modelmux exited", "error", err)
 		os.Exit(1)
@@ -39,10 +49,16 @@ func run(configPath string, log *slog.Logger) error {
 	if err != nil {
 		return err
 	}
+	// A dedicated registry (instead of the global default) keeps metrics
+	// explicit and lets tests build as many gateways as they like.
+	reg := prometheus.NewRegistry()
+	m := metrics.New(reg)
+
 	rt, err := router.New(candidates, router.Options{
 		Routing: cfg.Routing,
 		Retry:   cfg.Retry,
 		Breaker: cfg.Breaker,
+		Metrics: m,
 		Logger:  log,
 	})
 	if err != nil {
@@ -50,8 +66,14 @@ func run(configPath string, log *slog.Logger) error {
 	}
 
 	srv := &http.Server{
-		Addr:              cfg.Server.Addr,
-		Handler:           server.New(rt, cfg.Server, log).Handler(),
+		Addr: cfg.Server.Addr,
+		Handler: server.New(server.Options{
+			Router:         rt,
+			Config:         cfg.Server,
+			Metrics:        m,
+			MetricsHandler: promhttp.HandlerFor(reg, promhttp.HandlerOpts{}),
+			Logger:         log,
+		}).Handler(),
 		ReadHeaderTimeout: 5 * time.Second,
 		WriteTimeout:      cfg.Server.RequestTimeout + 5*time.Second,
 	}

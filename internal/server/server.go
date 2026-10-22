@@ -10,30 +10,46 @@ import (
 	"time"
 
 	"github.com/faytonn/modelmux/internal/config"
+	"github.com/faytonn/modelmux/internal/logging"
+	"github.com/faytonn/modelmux/internal/metrics"
 	"github.com/faytonn/modelmux/internal/providers"
 	"github.com/faytonn/modelmux/internal/router"
 )
 
 const maxBodyBytes = 1 << 20 // 1 MiB
 
-type Server struct {
-	router *router.Router
-	cfg    config.Server
-	log    *slog.Logger
-	mux    *http.ServeMux
+// Options configures a Server.
+type Options struct {
+	Router         *router.Router
+	Config         config.Server
+	Metrics        *metrics.Metrics // may be nil
+	MetricsHandler http.Handler     // served at GET /metrics when set
+	Logger         *slog.Logger
 }
 
-func New(r *router.Router, cfg config.Server, log *slog.Logger) *Server {
-	s := &Server{router: r, cfg: cfg, log: log, mux: http.NewServeMux()}
+type Server struct {
+	router  *router.Router
+	cfg     config.Server
+	metrics *metrics.Metrics
+	log     *slog.Logger
+	mux     *http.ServeMux
+}
+
+func New(opts Options) *Server {
+	s := &Server{router: opts.Router, cfg: opts.Config, metrics: opts.Metrics, log: opts.Logger, mux: http.NewServeMux()}
 	// Go 1.22+ patterns can match on the HTTP method, so wrong methods get a 405 for free.
-	s.mux.HandleFunc("POST /v1/chat", s.handleChat)
+	s.mux.Handle("POST /v1/chat", s.instrument(http.HandlerFunc(s.handleChat)))
 	s.mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, _ *http.Request) {
 		w.WriteHeader(http.StatusOK)
 	})
+	if opts.MetricsHandler != nil {
+		s.mux.Handle("GET /metrics", opts.MetricsHandler)
+	}
 	return s
 }
 
-func (s *Server) Handler() http.Handler { return s.mux }
+// Handler returns the full handler chain: request ID middleware, then routes.
+func (s *Server) Handler() http.Handler { return s.withRequestID(s.mux) }
 
 type chatRequest struct {
 	Messages    []providers.Message `json:"messages"`
@@ -47,6 +63,7 @@ type usage struct {
 }
 
 type chatResponse struct {
+	RequestID        string           `json:"request_id"`
 	Provider         string           `json:"provider"`
 	Model            string           `json:"model"`
 	Policy           string           `json:"routing_policy"`
@@ -58,22 +75,24 @@ type chatResponse struct {
 }
 
 type errorResponse struct {
-	Error    string           `json:"error"`
-	Attempts []router.Attempt `json:"attempts,omitempty"`
+	RequestID string           `json:"request_id,omitempty"`
+	Error     string           `json:"error"`
+	Attempts  []router.Attempt `json:"attempts,omitempty"`
 }
 
 func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 	start := time.Now()
+	reqID := logging.RequestID(r.Context())
 
 	var req chatRequest
 	dec := json.NewDecoder(http.MaxBytesReader(w, r.Body, maxBodyBytes))
 	dec.DisallowUnknownFields()
 	if err := dec.Decode(&req); err != nil {
-		writeJSON(w, http.StatusBadRequest, errorResponse{Error: "invalid JSON body: " + err.Error()})
+		writeJSON(w, http.StatusBadRequest, errorResponse{RequestID: reqID, Error: "invalid JSON body: " + err.Error()})
 		return
 	}
 	if err := validate(&req); err != nil {
-		writeJSON(w, http.StatusBadRequest, errorResponse{Error: err.Error()})
+		writeJSON(w, http.StatusBadRequest, errorResponse{RequestID: reqID, Error: err.Error()})
 		return
 	}
 	if req.MaxTokens == 0 {
@@ -91,12 +110,16 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 		if res != nil {
 			attempts = res.Attempts
 		}
-		s.log.Warn("chat request failed", "error", err)
-		writeJSON(w, statusFor(err), errorResponse{Error: err.Error(), Attempts: attempts})
+		s.log.WarnContext(ctx, "chat request failed", "error", err, "attempts", len(attempts))
+		writeJSON(w, statusFor(err), errorResponse{RequestID: reqID, Error: err.Error(), Attempts: attempts})
 		return
 	}
 
+	s.log.InfoContext(ctx, "chat request served",
+		"provider", res.Provider, "model", res.Model, "policy", res.Policy,
+		"attempts", len(res.Attempts), "cost_usd", res.CostUSD)
 	writeJSON(w, http.StatusOK, chatResponse{
+		RequestID:        reqID,
 		Provider:         res.Provider,
 		Model:            res.Model,
 		Policy:           res.Policy,
