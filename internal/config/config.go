@@ -168,6 +168,10 @@ func (c *Config) validate() error {
 		seen[p.Name] = true
 		switch p.Type {
 		case "mock":
+		case "anthropic", "openai":
+			if p.APIKeyEnv == "" {
+				errs = append(errs, fmt.Errorf("provider %q: api_key_env is required (keys are read from the environment, never from this file)", p.Name))
+			}
 		default:
 			errs = append(errs, fmt.Errorf("provider %q: unknown type %q", p.Name, p.Type))
 		}

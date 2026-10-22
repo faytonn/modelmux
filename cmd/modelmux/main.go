@@ -35,7 +35,7 @@ func run(configPath string, log *slog.Logger) error {
 	if err != nil {
 		return err
 	}
-	candidates, err := buildCandidates(cfg)
+	candidates, err := buildCandidates(cfg, log)
 	if err != nil {
 		return err
 	}
@@ -84,19 +84,39 @@ func run(configPath string, log *slog.Logger) error {
 
 // buildCandidates turns provider config into router candidates. Wiring lives
 // here so that config and providers do not need to import each other.
-func buildCandidates(cfg *config.Config) ([]router.Candidate, error) {
+// A real provider whose API key is not set is skipped with a warning, so the
+// same config works on a laptop without keys.
+func buildCandidates(cfg *config.Config, log *slog.Logger) ([]router.Candidate, error) {
+	// One shared client: it pools connections. No client timeout; every call
+	// is bounded by its context instead.
+	client := &http.Client{}
+
 	var out []router.Candidate
 	for _, pc := range cfg.Providers {
 		var p providers.Provider
 		switch pc.Type {
 		case "mock":
 			p = providers.NewMock(pc.Name, providers.MockConfig(pc.Mock))
+		case "anthropic", "openai":
+			key := os.Getenv(pc.APIKeyEnv)
+			if key == "" {
+				log.Warn("skipping provider: API key not set", "provider", pc.Name, "env", pc.APIKeyEnv)
+				continue
+			}
+			if pc.Type == "anthropic" {
+				p = providers.NewAnthropic(pc.Name, pc.BaseURL, key, client)
+			} else {
+				p = providers.NewOpenAI(pc.Name, pc.BaseURL, key, client)
+			}
 		default:
 			return nil, fmt.Errorf("provider %q: unknown type %q", pc.Name, pc.Type)
 		}
 		for _, m := range pc.Models {
 			out = append(out, router.Candidate{Provider: p, Model: m, Timeout: pc.AttemptTimeout})
 		}
+	}
+	if len(out) == 0 {
+		return nil, errors.New("no usable providers: set an API key or add a mock provider")
 	}
 	return out, nil
 }

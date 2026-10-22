@@ -1,0 +1,69 @@
+# ModelMux configuration for real providers.
+#
+#   export ANTHROPIC_API_KEY=...   # or put them in a local .env (git-ignored)
+#   export OPENAI_API_KEY=...
+#   go run ./cmd/modelmux -config config.real.yaml
+#
+# A provider whose key is missing is skipped at startup with a warning.
+# Model IDs, context windows and prices change over time: check each
+# provider's docs and pricing page before relying on the cost numbers below.
+# Prices are USD per 1K tokens.
+
+server:
+  addr: ":8080"
+  request_timeout: 60s
+  default_max_tokens: 512
+
+routing:
+  policy: rule
+  latency_window: 100
+  rules:
+    # Very long prompts go to the model with the largest context window.
+    - name: huge-prompts
+      min_prompt_tokens: 150000
+      prefer: [openai/gpt-4.1]
+
+retry:
+  max_attempts: 3
+  base_delay: 250ms
+  max_delay: 4s
+  max_retry_after: 10s
+
+breaker:
+  failure_threshold: 5
+  open_timeout: 30s
+
+providers:
+  - name: anthropic
+    type: anthropic
+    api_key_env: ANTHROPIC_API_KEY
+    base_url: https://api.anthropic.com
+    attempt_timeout: 30s
+    models:
+      - name: claude-haiku-5-5
+        context_window: 200000
+        input_price_per_1k: 0.001
+        output_price_per_1k: 0.005
+        quality: 2
+      - name: claude-sonnet-5-5
+        context_window: 200000
+        input_price_per_1k: 0.003
+        output_price_per_1k: 0.015
+        quality: 4
+
+  - name: openai
+    type: openai
+    api_key_env: OPENAI_API_KEY
+    base_url: https://api.openai.com
+    attempt_timeout: 30s
+    models:
+      - name: gpt-4.1-mini
+        context_window: 1000000
+        input_price_per_1k: 0.0004
+        output_price_per_1k: 0.0016
+        quality: 1
+      - name: gpt-4.1
+        context_window: 1000000
+        input_price_per_1k: 0.002
+        output_price_per_1k: 0.008
+        quality: 3
