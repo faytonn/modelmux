@@ -1,0 +1,23 @@
+# Secrets: API keys live in the environment or a local .env file, never in git.
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+secrets/
+
+# Build output
+/bin/
+/modelmux
+/modelmux.exe
+*.exe
+*.test
+*.out
+coverage.*
+
+# Editors / OS
+.idea/
+.vscode/
+*.swp
+.DS_Store
+Thumbs.db

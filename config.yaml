@@ -1,0 +1,53 @@
+# ModelMux configuration.
+# This default config uses only mock providers, so it runs without API keys.
+# API keys are never stored here: real providers name an environment variable
+# (api_key_env) that holds the key.
+
+server:
+  addr: ":8080"
+  request_timeout: 15s      # budget for the whole request, including retries and fallbacks
+  default_max_tokens: 512
+
+# Prices are made-up values for the mocks, in USD per 1K tokens.
+providers:
+  - name: mock-cheap
+    type: mock
+    attempt_timeout: 2s
+    mock:
+      latency: 80ms
+      jitter: 40ms
+    models:
+      - name: cheap-small
+        context_window: 8000
+        input_price_per_1k: 0.0002
+        output_price_per_1k: 0.0008
+        quality: 1
+
+  - name: mock-flaky
+    type: mock
+    attempt_timeout: 2s
+    mock:
+      latency: 40ms
+      jitter: 20ms
+      error_rate: 0.3
+      rate_limit_rate: 0.1
+      retry_after: 300ms
+    models:
+      - name: fast-medium
+        context_window: 32000
+        input_price_per_1k: 0.001
+        output_price_per_1k: 0.003
+        quality: 2
+
+  - name: mock-premium
+    type: mock
+    attempt_timeout: 5s
+    mock:
+      latency: 400ms
+      jitter: 200ms
+    models:
+      - name: premium-large
+        context_window: 200000
+        input_price_per_1k: 0.003
+        output_price_per_1k: 0.015
+        quality: 3
