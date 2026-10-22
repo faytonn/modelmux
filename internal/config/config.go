@@ -17,7 +17,14 @@ type Config struct {
 	Server    Server     `yaml:"server"`
 	Routing   Routing    `yaml:"routing"`
 	Retry     Retry      `yaml:"retry"`
+	Breaker   Breaker    `yaml:"breaker"`
 	Providers []Provider `yaml:"providers"`
+}
+
+// Breaker configures the per-provider circuit breakers.
+type Breaker struct {
+	FailureThreshold int           `yaml:"failure_threshold"` // consecutive failures before opening
+	OpenTimeout      time.Duration `yaml:"open_timeout"`      // how long to stay open before a probe
 }
 
 // Retry applies to each candidate in the fallback chain separately.
@@ -125,6 +132,12 @@ func (c *Config) applyDefaults() {
 	}
 	if c.Retry.MaxRetryAfter == 0 {
 		c.Retry.MaxRetryAfter = 5 * time.Second
+	}
+	if c.Breaker.FailureThreshold == 0 {
+		c.Breaker.FailureThreshold = 5
+	}
+	if c.Breaker.OpenTimeout == 0 {
+		c.Breaker.OpenTimeout = 10 * time.Second
 	}
 	for i := range c.Providers {
 		if c.Providers[i].AttemptTimeout == 0 {

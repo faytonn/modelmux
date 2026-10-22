@@ -9,6 +9,7 @@ import (
 
 	"github.com/faytonn/modelmux/internal/config"
 	"github.com/faytonn/modelmux/internal/providers"
+	"github.com/faytonn/modelmux/internal/resilience"
 )
 
 // mockCand builds a candidate backed by a mock provider. Lower price means the
@@ -23,9 +24,15 @@ func mockCand(name string, price float64, timeout time.Duration, mc providers.Mo
 
 func newTestRouter(t *testing.T, cands ...Candidate) *Router {
 	t.Helper()
+	return newTestRouterWithBreaker(t, config.Breaker{FailureThreshold: 100, OpenTimeout: time.Minute}, cands...)
+}
+
+func newTestRouterWithBreaker(t *testing.T, b config.Breaker, cands ...Candidate) *Router {
+	t.Helper()
 	r, err := New(cands, Options{
 		Routing: config.Routing{Policy: "cost", LatencyWindow: 10},
 		Retry:   config.Retry{MaxAttempts: 2, BaseDelay: time.Millisecond, MaxDelay: 5 * time.Millisecond, MaxRetryAfter: time.Second},
+		Breaker: b,
 		Logger:  discardLogger(),
 	})
 	if err != nil {
@@ -129,5 +136,36 @@ func TestRequestBudgetStopsTheChain(t *testing.T) {
 	}
 	if len(res.Attempts) != 1 {
 		t.Errorf("attempts = %v, want only the slow one", attemptKeys(res))
+	}
+}
+
+func TestOpenBreakerSkipsProviderWithoutCallingIt(t *testing.T) {
+	r := newTestRouterWithBreaker(t, config.Breaker{FailureThreshold: 2, OpenTimeout: time.Minute},
+		mockCand("a", 0.001, 0, providers.MockConfig{ErrorRate: 1}),
+		mockCand("b", 0.002, 0, providers.MockConfig{}),
+	)
+
+	// First request: both attempts on a fail, which opens a's breaker; b serves.
+	res, err := r.Chat(context.Background(), hello)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := strings.Join(attemptKeys(res), ","); got != "a:err,a:err,b:ok" {
+		t.Fatalf("first request attempts = %s, want a:err,a:err,b:ok", got)
+	}
+	if s := r.breakers["a"].State(); s != resilience.Open {
+		t.Fatalf("breaker for a is %v, want open", s)
+	}
+
+	// Second request: a is skipped instantly, no retries, straight to b.
+	res, err = r.Chat(context.Background(), hello)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := strings.Join(attemptKeys(res), ","); got != "a:err,b:ok" {
+		t.Errorf("second request attempts = %s, want a:err,b:ok", got)
+	}
+	if !strings.Contains(res.Attempts[0].Error, "circuit breaker open") {
+		t.Errorf("first attempt error = %q, want circuit breaker open", res.Attempts[0].Error)
 	}
 }

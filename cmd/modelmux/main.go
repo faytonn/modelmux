@@ -39,7 +39,12 @@ func run(configPath string, log *slog.Logger) error {
 	if err != nil {
 		return err
 	}
-	rt, err := router.New(candidates, router.Options{Routing: cfg.Routing, Retry: cfg.Retry, Logger: log})
+	rt, err := router.New(candidates, router.Options{
+		Routing: cfg.Routing,
+		Retry:   cfg.Retry,
+		Breaker: cfg.Breaker,
+		Logger:  log,
+	})
 	if err != nil {
 		return err
 	}

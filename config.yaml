@@ -24,6 +24,10 @@ retry:                      # per candidate in the fallback chain
   max_delay: 2s
   max_retry_after: 5s       # a longer Retry-After means fall back instead of waiting
 
+breaker:                    # one circuit breaker per provider
+  failure_threshold: 5      # consecutive 5xx/429/timeout/network failures before opening
+  open_timeout: 10s         # then skip the provider for this long before sending one probe
+
 # Prices are made-up values for the mocks, in USD per 1K tokens.
 providers:
   - name: mock-cheap

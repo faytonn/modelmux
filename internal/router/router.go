@@ -61,6 +61,7 @@ type Result struct {
 type Options struct {
 	Routing config.Routing
 	Retry   config.Retry
+	Breaker config.Breaker
 	Logger  *slog.Logger
 }
 
@@ -73,6 +74,7 @@ type Router struct {
 	defaultPolicy Policy
 	latency       *LatencyTracker
 	retry         resilience.RetryPolicy
+	breakers      map[string]*resilience.Breaker // one per provider
 	log           *slog.Logger
 }
 
@@ -88,6 +90,18 @@ func New(candidates []Candidate, opts Options) (*Router, error) {
 	if !ok {
 		return nil, fmt.Errorf("unknown routing policy %q", opts.Routing.Policy)
 	}
+	breakers := map[string]*resilience.Breaker{}
+	for _, c := range candidates {
+		name := c.Provider.Name()
+		if _, ok := breakers[name]; ok {
+			continue // models of the same provider share one breaker
+		}
+		breakers[name] = resilience.NewBreaker(opts.Breaker.FailureThreshold, opts.Breaker.OpenTimeout,
+			func(from, to resilience.State) {
+				opts.Logger.Warn("circuit breaker state change", "provider", name, "from", from.String(), "to", to.String())
+			})
+	}
+
 	return &Router{
 		candidates:    candidates,
 		policies:      policies,
@@ -100,7 +114,8 @@ func New(candidates []Candidate, opts Options) (*Router, error) {
 			MaxRetryAfter: opts.Retry.MaxRetryAfter,
 			Classify:      providers.Classify,
 		},
-		log: opts.Logger,
+		breakers: breakers,
+		log:      opts.Logger,
 	}, nil
 }
 
@@ -146,27 +161,50 @@ func (r *Router) Chat(ctx context.Context, req Request) (*Result, error) {
 }
 
 // tryCandidate calls one candidate with retries, recording every attempt.
+// Each attempt first asks the provider's circuit breaker for permission, so a
+// breaker that opens mid-retry stops the retries too.
 func (r *Router) tryCandidate(ctx context.Context, c Candidate, req Request, res *Result) (*providers.Response, error) {
 	retry := r.retry
 	retry.OnRetry = func(attempt int, err error, delay time.Duration) {
 		r.log.InfoContext(ctx, "retrying", "candidate", c.Key(), "attempt", attempt, "delay", delay, "error", err)
 	}
+	breaker := r.breakers[c.Provider.Name()]
 
 	return resilience.Do(ctx, retry, func(ctx context.Context) (*providers.Response, error) {
+		a := Attempt{Provider: c.Provider.Name(), Model: c.Model.Name}
+		if !breaker.Allow() {
+			// Not retryable by providers.Classify, so the router moves straight to the next candidate.
+			err := fmt.Errorf("%s: %w", c.Provider.Name(), resilience.ErrOpen)
+			a.Error = err.Error()
+			res.Attempts = append(res.Attempts, a)
+			return nil, err
+		}
+
+		attemptCtx := ctx
 		if c.Timeout > 0 {
 			var cancel context.CancelFunc
-			ctx, cancel = context.WithTimeout(ctx, c.Timeout)
+			attemptCtx, cancel = context.WithTimeout(ctx, c.Timeout)
 			defer cancel()
 		}
 		start := time.Now()
-		resp, err := c.Provider.Chat(ctx, providers.Request{Model: c.Model.Name, Messages: req.Messages, MaxTokens: req.MaxTokens})
+		resp, err := c.Provider.Chat(attemptCtx, providers.Request{Model: c.Model.Name, Messages: req.Messages, MaxTokens: req.MaxTokens})
 		elapsed := time.Since(start)
+		a.DurationMS = elapsed.Milliseconds()
 
-		a := Attempt{Provider: c.Provider.Name(), Model: c.Model.Name, DurationMS: elapsed.Milliseconds()}
+		retryable, _ := providers.Classify(err)
+		switch {
+		case err == nil:
+			breaker.Success()
+			r.latency.Observe(c.Provider.Name(), elapsed)
+		case ctx.Err() != nil:
+			breaker.Release() // the request was cancelled or ran out of time: says nothing about the provider
+		case retryable:
+			breaker.Failure() // 5xx, 429, timeout, network error
+		default:
+			breaker.Success() // e.g. 400/401: the provider is up, it rejected this request
+		}
 		if err != nil {
 			a.Error = err.Error()
-		} else {
-			r.latency.Observe(c.Provider.Name(), elapsed)
 		}
 		res.Attempts = append(res.Attempts, a)
 		return resp, err
