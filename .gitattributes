@@ -1,0 +1,2 @@
+# Keep LF line endings in the repo and working tree (gofmt and shell scripts expect them).
+* text=auto eol=lf

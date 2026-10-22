@@ -4,7 +4,9 @@ package router
 import (
 	"context"
 	"errors"
+	"fmt"
 	"log/slog"
+	"time"
 
 	"github.com/faytonn/modelmux/internal/config"
 	"github.com/faytonn/modelmux/internal/providers"
@@ -40,36 +42,70 @@ type Attempt struct {
 type Result struct {
 	Provider string
 	Model    string
+	Policy   string
 	Response *providers.Response
 	CostUSD  float64
 	Attempts []Attempt
 }
 
+// hintPolicies maps a request's routing_hint to a policy name.
+var hintPolicies = map[string]string{"cheap": "cost", "fast": "latency", "quality": "quality"}
+
 type Router struct {
-	candidates []Candidate
-	log        *slog.Logger
+	candidates    []Candidate
+	policies      map[string]Policy
+	defaultPolicy Policy
+	latency       *LatencyTracker
+	log           *slog.Logger
 }
 
-func New(candidates []Candidate, log *slog.Logger) *Router {
-	return &Router{candidates: candidates, log: log}
+func New(candidates []Candidate, cfg config.Routing, log *slog.Logger) (*Router, error) {
+	latency := NewLatencyTracker(cfg.LatencyWindow)
+	policies := map[string]Policy{
+		"cost":    CostPolicy{},
+		"latency": LatencyPolicy{Stats: latency},
+		"quality": QualityPolicy{},
+		"rule":    RulePolicy{Rules: cfg.Rules, Base: CostPolicy{}},
+	}
+	def, ok := policies[cfg.Policy]
+	if !ok {
+		return nil, fmt.Errorf("unknown routing policy %q", cfg.Policy)
+	}
+	return &Router{candidates: candidates, policies: policies, defaultPolicy: def, latency: latency, log: log}, nil
 }
 
-// Chat sends the request to the first candidate. Routing policies, retries and
-// fallbacks are layered on in later steps.
+// plan picks the policy for this request and returns the ordered candidates.
+func (r *Router) plan(req Request) (Policy, []Candidate) {
+	policy := r.defaultPolicy
+	if name, ok := hintPolicies[req.Hint]; ok {
+		policy = r.policies[name]
+	}
+	info := RouteInfo{PromptTokens: providers.EstimateTokens(req.Messages), MaxTokens: req.MaxTokens}
+	return policy, policy.Rank(info, fitting(info, r.candidates))
+}
+
+// Chat sends the request to the top-ranked candidate. Retries and fallbacks
+// are layered on in the next step.
 func (r *Router) Chat(ctx context.Context, req Request) (*Result, error) {
-	if len(r.candidates) == 0 {
+	policy, ranked := r.plan(req)
+	if len(ranked) == 0 {
 		return nil, ErrNoCandidates
 	}
-	c := r.candidates[0]
+	c := ranked[0]
+	r.log.Debug("routing", "policy", policy.Name(), "candidate", c.Key())
+
+	start := time.Now()
 	resp, err := c.Provider.Chat(ctx, providers.Request{Model: c.Model.Name, Messages: req.Messages, MaxTokens: req.MaxTokens})
 	attempt := Attempt{Provider: c.Provider.Name(), Model: c.Model.Name}
 	if err != nil {
 		attempt.Error = err.Error()
-		return &Result{Attempts: []Attempt{attempt}}, err
+		return &Result{Policy: policy.Name(), Attempts: []Attempt{attempt}}, err
 	}
+	r.latency.Observe(c.Provider.Name(), time.Since(start))
 	return &Result{
 		Provider: c.Provider.Name(),
 		Model:    c.Model.Name,
+		Policy:   policy.Name(),
 		Response: resp,
 		CostUSD:  c.Model.Cost(resp.InputTokens, resp.OutputTokens),
 		Attempts: []Attempt{attempt},

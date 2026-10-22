@@ -49,6 +49,7 @@ type usage struct {
 type chatResponse struct {
 	Provider         string           `json:"provider"`
 	Model            string           `json:"model"`
+	Policy           string           `json:"routing_policy"`
 	Content          string           `json:"content"`
 	Usage            usage            `json:"usage"`
 	EstimatedCostUSD float64          `json:"estimated_cost_usd"`
@@ -98,6 +99,7 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, chatResponse{
 		Provider:         res.Provider,
 		Model:            res.Model,
+		Policy:           res.Policy,
 		Content:          res.Response.Content,
 		Usage:            usage{InputTokens: res.Response.InputTokens, OutputTokens: res.Response.OutputTokens},
 		EstimatedCostUSD: res.CostUSD,

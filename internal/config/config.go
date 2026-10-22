@@ -15,7 +15,22 @@ import (
 
 type Config struct {
 	Server    Server     `yaml:"server"`
+	Routing   Routing    `yaml:"routing"`
 	Providers []Provider `yaml:"providers"`
+}
+
+type Routing struct {
+	Policy        string `yaml:"policy"`         // default policy: cost | latency | quality | rule
+	LatencyWindow int    `yaml:"latency_window"` // samples per provider used for p95
+	Rules         []Rule `yaml:"rules"`          // used by the rule policy, first match wins
+}
+
+// Rule moves the Prefer models ("provider/model") to the front of the
+// fallback chain when the prompt has at least MinPromptTokens tokens.
+type Rule struct {
+	Name            string   `yaml:"name"`
+	MinPromptTokens int      `yaml:"min_prompt_tokens"`
+	Prefer          []string `yaml:"prefer"`
 }
 
 type Server struct {
@@ -84,6 +99,12 @@ func (c *Config) applyDefaults() {
 	if c.Server.DefaultMaxTokens == 0 {
 		c.Server.DefaultMaxTokens = 512
 	}
+	if c.Routing.Policy == "" {
+		c.Routing.Policy = "cost"
+	}
+	if c.Routing.LatencyWindow == 0 {
+		c.Routing.LatencyWindow = 100
+	}
 	for i := range c.Providers {
 		if c.Providers[i].AttemptTimeout == 0 {
 			c.Providers[i].AttemptTimeout = 10 * time.Second
@@ -96,7 +117,13 @@ func (c *Config) validate() error {
 	if len(c.Providers) == 0 {
 		errs = append(errs, errors.New("at least one provider is required"))
 	}
+	switch c.Routing.Policy {
+	case "cost", "latency", "quality", "rule":
+	default:
+		errs = append(errs, fmt.Errorf("routing.policy %q must be cost, latency, quality or rule", c.Routing.Policy))
+	}
 	seen := map[string]bool{}
+	models := map[string]bool{} // "provider/model"
 	for _, p := range c.Providers {
 		if p.Name == "" {
 			errs = append(errs, errors.New("provider with empty name"))
@@ -116,6 +143,14 @@ func (c *Config) validate() error {
 		for _, m := range p.Models {
 			if m.Name == "" || m.ContextWindow <= 0 {
 				errs = append(errs, fmt.Errorf("provider %q: every model needs a name and a positive context_window", p.Name))
+			}
+			models[p.Name+"/"+m.Name] = true
+		}
+	}
+	for _, r := range c.Routing.Rules {
+		for _, key := range r.Prefer {
+			if !models[key] {
+				errs = append(errs, fmt.Errorf("rule %q prefers unknown model %q (want provider/model)", r.Name, key))
 			}
 		}
 	}

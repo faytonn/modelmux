@@ -39,10 +39,14 @@ func run(configPath string, log *slog.Logger) error {
 	if err != nil {
 		return err
 	}
+	rt, err := router.New(candidates, cfg.Routing, log)
+	if err != nil {
+		return err
+	}
 
 	srv := &http.Server{
 		Addr:              cfg.Server.Addr,
-		Handler:           server.New(router.New(candidates, log), cfg.Server, log).Handler(),
+		Handler:           server.New(rt, cfg.Server, log).Handler(),
 		ReadHeaderTimeout: 5 * time.Second,
 		WriteTimeout:      cfg.Server.RequestTimeout + 5*time.Second,
 	}

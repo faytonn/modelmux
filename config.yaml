@@ -8,6 +8,16 @@ server:
   request_timeout: 15s      # budget for the whole request, including retries and fallbacks
   default_max_tokens: 512
 
+routing:
+  # Default policy when a request has no routing_hint: cost | latency | quality | rule.
+  # Hints override it per request: cheap -> cost, fast -> latency, quality -> quality.
+  policy: rule
+  latency_window: 100       # recent samples per provider used to compute p95
+  rules:                    # first match wins; unmatched requests fall back to cost order
+    - name: long-prompts-to-large-context
+      min_prompt_tokens: 3000
+      prefer: [mock-premium/premium-large]
+
 # Prices are made-up values for the mocks, in USD per 1K tokens.
 providers:
   - name: mock-cheap
