@@ -24,19 +24,23 @@ type Options struct {
 	Config         config.Server
 	Metrics        *metrics.Metrics // may be nil
 	MetricsHandler http.Handler     // served at GET /metrics when set
-	Logger         *slog.Logger
+	// Mocks enables PATCH /admin/mocks/{name} for these providers. Leave nil
+	// in production: the endpoint has no authentication.
+	Mocks  map[string]*providers.Mock
+	Logger *slog.Logger
 }
 
 type Server struct {
 	router  *router.Router
 	cfg     config.Server
 	metrics *metrics.Metrics
+	mocks   map[string]*providers.Mock
 	log     *slog.Logger
 	mux     *http.ServeMux
 }
 
 func New(opts Options) *Server {
-	s := &Server{router: opts.Router, cfg: opts.Config, metrics: opts.Metrics, log: opts.Logger, mux: http.NewServeMux()}
+	s := &Server{router: opts.Router, cfg: opts.Config, metrics: opts.Metrics, mocks: opts.Mocks, log: opts.Logger, mux: http.NewServeMux()}
 	// Go 1.22+ patterns can match on the HTTP method, so wrong methods get a 405 for free.
 	s.mux.Handle("POST /v1/chat", s.instrument(http.HandlerFunc(s.handleChat)))
 	s.mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, _ *http.Request) {
@@ -44,6 +48,9 @@ func New(opts Options) *Server {
 	})
 	if opts.MetricsHandler != nil {
 		s.mux.Handle("GET /metrics", opts.MetricsHandler)
+	}
+	if opts.Mocks != nil {
+		s.mux.HandleFunc("PATCH /admin/mocks/{name}", s.handleMockUpdate)
 	}
 	return s
 }
@@ -153,9 +160,16 @@ func validate(req *chatRequest) error {
 	return nil
 }
 
+// statusClientClosedRequest is nginx's non-standard 499: the client hung up
+// before we answered. Using it keeps cancelled requests from showing up as
+// 502s (provider failures) in metrics.
+const statusClientClosedRequest = 499
+
 // statusFor maps router errors to HTTP status codes.
 func statusFor(err error) int {
 	switch {
+	case errors.Is(err, context.Canceled):
+		return statusClientClosedRequest
 	case errors.Is(err, context.DeadlineExceeded):
 		return http.StatusGatewayTimeout
 	case errors.Is(err, router.ErrNoCandidates):

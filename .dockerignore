@@ -1,0 +1,9 @@
+# Keep secrets and local artefacts out of the build context.
+.env
+.env.*
+.git
+.claude
+bin
+*.exe
+*.test
+*.out

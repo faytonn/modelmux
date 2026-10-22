@@ -27,6 +27,7 @@ import (
 func main() {
 	configPath := flag.String("config", "config.yaml", "path to the YAML config file")
 	logFormat := flag.String("log-format", "json", "log format: json or text")
+	admin := flag.Bool("admin", false, "enable PATCH /admin/mocks/{name} (unauthenticated; for demos and load tests only)")
 	flag.Parse()
 
 	var base slog.Handler = slog.NewJSONHandler(os.Stdout, nil)
@@ -34,18 +35,18 @@ func main() {
 		base = slog.NewTextHandler(os.Stdout, nil)
 	}
 	log := slog.New(logging.Handler{Handler: base})
-	if err := run(*configPath, log); err != nil {
+	if err := run(*configPath, *admin, log); err != nil {
 		log.Error("modelmux exited", "error", err)
 		os.Exit(1)
 	}
 }
 
-func run(configPath string, log *slog.Logger) error {
+func run(configPath string, admin bool, log *slog.Logger) error {
 	cfg, err := config.Load(configPath)
 	if err != nil {
 		return err
 	}
-	candidates, err := buildCandidates(cfg, log)
+	candidates, mocks, err := buildCandidates(cfg, log)
 	if err != nil {
 		return err
 	}
@@ -72,6 +73,7 @@ func run(configPath string, log *slog.Logger) error {
 			Config:         cfg.Server,
 			Metrics:        m,
 			MetricsHandler: promhttp.HandlerFor(reg, promhttp.HandlerOpts{}),
+			Mocks:          adminMocks(admin, mocks, log),
 			Logger:         log,
 		}).Handler(),
 		ReadHeaderTimeout: 5 * time.Second,
@@ -108,17 +110,20 @@ func run(configPath string, log *slog.Logger) error {
 // here so that config and providers do not need to import each other.
 // A real provider whose API key is not set is skipped with a warning, so the
 // same config works on a laptop without keys.
-func buildCandidates(cfg *config.Config, log *slog.Logger) ([]router.Candidate, error) {
+func buildCandidates(cfg *config.Config, log *slog.Logger) ([]router.Candidate, map[string]*providers.Mock, error) {
 	// One shared client: it pools connections. No client timeout; every call
 	// is bounded by its context instead.
 	client := &http.Client{}
 
 	var out []router.Candidate
+	mocks := map[string]*providers.Mock{}
 	for _, pc := range cfg.Providers {
 		var p providers.Provider
 		switch pc.Type {
 		case "mock":
-			p = providers.NewMock(pc.Name, providers.MockConfig(pc.Mock))
+			mock := providers.NewMock(pc.Name, providers.MockConfig(pc.Mock))
+			mocks[pc.Name] = mock
+			p = mock
 		case "anthropic", "openai":
 			key := os.Getenv(pc.APIKeyEnv)
 			if key == "" {
@@ -131,14 +136,24 @@ func buildCandidates(cfg *config.Config, log *slog.Logger) ([]router.Candidate, 
 				p = providers.NewOpenAI(pc.Name, pc.BaseURL, key, client)
 			}
 		default:
-			return nil, fmt.Errorf("provider %q: unknown type %q", pc.Name, pc.Type)
+			return nil, nil, fmt.Errorf("provider %q: unknown type %q", pc.Name, pc.Type)
 		}
 		for _, m := range pc.Models {
 			out = append(out, router.Candidate{Provider: p, Model: m, Timeout: pc.AttemptTimeout})
 		}
 	}
 	if len(out) == 0 {
-		return nil, errors.New("no usable providers: set an API key or add a mock provider")
+		return nil, nil, errors.New("no usable providers: set an API key or add a mock provider")
 	}
-	return out, nil
+	return out, mocks, nil
+}
+
+// adminMocks returns the mocks to expose on the admin endpoint, or nil when
+// admin is disabled (which leaves the route unregistered).
+func adminMocks(enabled bool, mocks map[string]*providers.Mock, log *slog.Logger) map[string]*providers.Mock {
+	if !enabled {
+		return nil
+	}
+	log.Warn("admin endpoint enabled: PATCH /admin/mocks/{name} is unauthenticated, do not expose it")
+	return mocks
 }

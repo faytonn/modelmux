@@ -162,7 +162,13 @@ func (r *Router) Chat(ctx context.Context, req Request) (*Result, error) {
 		}
 		if i < len(ranked)-1 {
 			r.metrics.ObserveFallback(c.Provider.Name(), c.Model.Name)
-			r.log.WarnContext(ctx, "candidate failed, falling back",
+			// Skipping an open breaker happens on every request during an outage;
+			// the state change itself is already logged once at WARN.
+			level := slog.LevelWarn
+			if errors.Is(err, resilience.ErrOpen) {
+				level = slog.LevelDebug
+			}
+			r.log.Log(ctx, level, "candidate failed, falling back",
 				"failed", c.Key(), "next", ranked[i+1].Key(), "error", err)
 		}
 	}
