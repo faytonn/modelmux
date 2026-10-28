@@ -1,5 +1,8 @@
 # ModelMux
 
+[![CI](https://github.com/faytonn/modelmux/actions/workflows/ci.yml/badge.svg)](https://github.com/faytonn/modelmux/actions/workflows/ci.yml)
+[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
+
 A small LLM gateway in Go. It exposes one endpoint, `POST /v1/chat`, in front of several LLM providers and decides, per request, which provider and model should answer, what to do when it fails, and how to tell you about it.
 
 It is a weekend-sized portfolio project focused on the parts of LLM routing that matter in production: model selection, fallbacks, retries, circuit breaking and cost/latency visibility.
@@ -123,7 +126,7 @@ go run ./cmd/modelmux -config config.real.yaml
 # or: MODELMUX_CONFIG=/etc/modelmux/config.real.yaml docker compose up --build
 ```
 
-> Model IDs and prices in `config.real.yaml` are examples. Check each provider's docs and pricing page before trusting the cost numbers.
+> Model IDs and prices in `config.real.yaml` were checked against each provider's pricing page in October 2026. Prices change, so re-check them before trusting the cost numbers.
 
 ### API
 
