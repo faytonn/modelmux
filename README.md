@@ -142,6 +142,145 @@ Status codes: `200`; `400` invalid request; `422` no model's context window fits
 
 Other endpoints: `GET /metrics`, `GET /healthz`, and `PATCH /admin/mocks/{name}` (only with `-admin`, see the load test below).
 
+## Demo walkthrough
+
+A 5-minute demo you can run live, with no API keys. The commands are bash: on Windows, use Git Bash or WSL (PowerShell's `curl` is a different program). `jq` only trims the output to the fields worth looking at.
+
+**1. Start the gateway and Prometheus.**
+
+```bash
+docker compose up --build -d     # or, without Docker: go run ./cmd/modelmux -admin
+docker compose logs -f modelmux  # optional, in a second terminal: JSON logs with request IDs
+```
+
+**2. One endpoint, different routing policies.** The same prompt goes to a different provider depending on `routing_hint`.
+
+```bash
+for hint in cheap fast quality; do
+  curl -s localhost:8080/v1/chat \
+    -d "{\"messages\":[{\"role\":\"user\",\"content\":\"Hello!\"}],\"routing_hint\":\"$hint\"}" \
+    | jq -c '{provider, model, routing_policy, latency_ms}'
+done
+```
+
+```
+{"provider":"mock-cheap","model":"cheap-small","routing_policy":"cost","latency_ms":111}
+{"provider":"mock-flaky","model":"fast-medium","routing_policy":"latency","latency_ms":137}
+{"provider":"mock-premium","model":"premium-large","routing_policy":"quality","latency_ms":553}
+```
+
+`mock-flaky` fails 30% of the time, so the `fast` request sometimes shows a retry in its `attempts`.
+
+**3. Rule-based routing for long prompts.** A prompt of about 3,500 tokens matches the `long-prompts-to-large-context` rule in `config.yaml`.
+
+```bash
+jq -n --arg c "$(head -c 14000 /dev/zero | tr '\0' a)" '{messages:[{role:"user",content:$c}]}' \
+  | curl -s localhost:8080/v1/chat -d @- | jq -c '{provider, model, routing_policy}'
+```
+
+```
+{"provider":"mock-premium","model":"premium-large","routing_policy":"rule"}
+```
+
+**4. Request tracing.** Send your own request ID. It comes back in the header and the body, and appears on every log line for this request.
+
+```bash
+curl -si localhost:8080/v1/chat -H 'X-Request-ID: demo-123' \
+  -d '{"messages":[{"role":"user","content":"hi"}]}' | grep -iE 'x-request-id|"request_id"'
+```
+
+**5. Validation errors.**
+
+```bash
+curl -s -w ' HTTP %{http_code}\n' localhost:8080/v1/chat -d '{"messages":[]}'
+curl -s -w ' HTTP %{http_code}\n' localhost:8080/v1/chat \
+  -d '{"messages":[{"role":"user","content":"hi"}],"max_tokens":500000}'
+```
+
+```
+{"request_id":"4e73f02a0427c0cf","error":"messages must not be empty"} HTTP 400
+{"request_id":"81f5d23019e61e88","error":"no model can serve this request"} HTTP 422
+```
+
+No model has a 500K-token context window, so the second request gets a `422`.
+
+**6. Outage: retries, fallback and the circuit breaker.** Make the cheap provider fail every call, then send a request.
+
+```bash
+curl -s -X PATCH localhost:8080/admin/mocks/mock-cheap -d '{"error_rate": 1}'
+
+chat() {
+  curl -s localhost:8080/v1/chat \
+    -d '{"messages":[{"role":"user","content":"Hello!"}],"routing_hint":"cheap"}' \
+    | jq -c '{provider, attempts: [.attempts[] | {provider, error}]}'
+}
+chat
+```
+
+```
+{"provider":"mock-flaky","attempts":[
+  {"provider":"mock-cheap","error":"mock-cheap: status 503: mock upstream failure"},
+  {"provider":"mock-cheap","error":"mock-cheap: status 503: mock upstream failure"},
+  {"provider":"mock-cheap","error":"mock-cheap: status 503: mock upstream failure"},
+  {"provider":"mock-flaky","error":null}]}
+```
+
+`mock-cheap` was tried 3 times with backoff, then the request fell back to the next provider. The client still got a `200`. Your output can differ: `mock-flaky` fails at random, so the request may also fall through to `mock-premium`. After 5 consecutive failures the breaker opens, and `mock-cheap` is skipped without a network call:
+
+```bash
+chat; chat; chat
+```
+
+The last line looks like this:
+
+```
+{"provider":"mock-flaky","attempts":[{"provider":"mock-cheap","error":"mock-cheap: circuit breaker open"},{"provider":"mock-flaky","error":null}]}
+```
+
+If `mock-flaky` has also failed 5 times in a row, its breaker is open too and traffic goes to `mock-premium`. That is the same behaviour on a second provider.
+
+**7. Metrics.**
+
+```bash
+curl -s localhost:8080/metrics | grep -E '^modelmux_(circuit_breaker_state|fallbacks_total)'
+```
+
+```
+modelmux_circuit_breaker_state{provider="mock-cheap"} 1
+modelmux_circuit_breaker_state{provider="mock-flaky"} 0
+modelmux_circuit_breaker_state{provider="mock-premium"} 0
+modelmux_fallbacks_total{model="cheap-small",provider="mock-cheap"} 5
+```
+
+Counters add up from when the gateway started, so after earlier runs your numbers will be higher.
+
+The same metrics are in Prometheus at http://localhost:9090. Try the queries from [Observability](#observability), for example `modelmux_circuit_breaker_state`.
+
+**8. Recovery.** Fix the provider. About 10 seconds later (`open_timeout`), the next request is a probe. It succeeds and the breaker closes.
+
+```bash
+curl -s -X PATCH localhost:8080/admin/mocks/mock-cheap -d '{"error_rate": 0}'
+sleep 11; chat
+```
+
+```
+{"provider":"mock-cheap","attempts":[{"provider":"mock-cheap","error":null}]}
+```
+
+**9. Under load.** The load test runs the same outage and recovery with 16 concurrent clients and prints throughput, error rate, p95 and breaker state every second. See [Load test](#load-test-fallback-and-circuit-breaking-under-failure) for real output.
+
+```bash
+go run ./cmd/loadtest -phase 10s
+```
+
+**10. Tests.**
+
+```bash
+go test ./...
+```
+
+Stop everything with `docker compose down`.
+
 ## How routing decisions work
 
 For each request the router:
