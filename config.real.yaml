@@ -18,10 +18,12 @@ routing:
   policy: rule
   latency_window: 100
   rules:
-    # Very long prompts go to the model with the largest context window.
-    - name: huge-prompts
-      min_prompt_tokens: 150000
-      prefer: [openai/gpt-4.1]
+    # Claude Haiku 5.5 costs 5x more for prompts over 100K tokens
+    # ($0.0005 / $0.0025 per 1K), which this config's flat prices don't
+    # model. Send long prompts to the cheapest model without that surcharge.
+    - name: long-prompts-skip-haiku-surcharge
+      min_prompt_tokens: 100000
+      prefer: [openai/gpt-4.1-mini]
 
 retry:
   max_attempts: 3
@@ -40,15 +42,16 @@ providers:
     base_url: https://api.anthropic.com
     attempt_timeout: 30s
     models:
+      # Haiku prices are for prompts up to 100K tokens; see the rule above.
       - name: claude-haiku-5-5
-        context_window: 200000
-        input_price_per_1k: 0.001
-        output_price_per_1k: 0.005
+        context_window: 1000000
+        input_price_per_1k: 0.0001
+        output_price_per_1k: 0.0005
         quality: 2
       - name: claude-sonnet-5-5
-        context_window: 200000
-        input_price_per_1k: 0.003
-        output_price_per_1k: 0.015
+        context_window: 1000000
+        input_price_per_1k: 0.002
+        output_price_per_1k: 0.010
         quality: 4
 
   - name: openai
