@@ -3,15 +3,15 @@
 [![CI](https://github.com/faytonn/modelmux/actions/workflows/ci.yml/badge.svg)](https://github.com/faytonn/modelmux/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 
-A small LLM gateway in Go. It exposes one endpoint, `POST /v1/chat`, in front of several LLM providers and decides, per request, which provider and model should answer, what to do when it fails, and how to tell you about it.
+A small LLM gateway in Python. It exposes one endpoint, `POST /v1/chat`, in front of several LLM providers and decides, per request, which provider and model should answer, what to do when it fails, and how to tell you about it.
 
 It is a weekend-sized portfolio project focused on the parts of LLM routing that matter in production: model selection, fallbacks, retries, circuit breaking and cost/latency visibility.
 
 - **Providers:** Anthropic (Claude), OpenAI, and a mock provider with configurable latency, error rate and 429s. **Everything runs and is tested without API keys.**
 - **Routing policies:** cost, latency (rolling p95), rule-based, quality. Each request can pick one with `routing_hint`.
-- **Reliability:** per-request and per-attempt timeouts (`context.Context`), retries with exponential backoff and full jitter for retryable errors only, `Retry-After` support, a fallback chain, and a per-provider circuit breaker.
-- **Observability:** Prometheus metrics labelled by provider and model, plus structured JSON logs (`log/slog`) with a request ID on every line.
-- **Small dependency set:** standard library `net/http`, plus `prometheus/client_golang` and a YAML parser.
+- **Reliability:** per-request and per-attempt timeouts (`asyncio.timeout`), retries with exponential backoff and full jitter for retryable errors only, `Retry-After` support, a fallback chain, a per-provider circuit breaker, and cancellation of upstream calls when the client disconnects.
+- **Observability:** Prometheus metrics labelled by provider and model, plus structured JSON logs with a request ID on every line.
+- **Small dependency set:** FastAPI and uvicorn for HTTP, `httpx` for upstream calls, `prometheus-client`, and PyYAML. No provider SDKs.
 
 ## Architecture
 
@@ -20,7 +20,7 @@ flowchart LR
     C[Client] -->|POST /v1/chat| MW
 
     subgraph Gateway
-        MW[Middleware<br/>request ID, HTTP metrics] --> H[Handler<br/>validate, request timeout]
+        MW[Middleware<br/>request ID] --> H[Handler<br/>validate, request timeout,<br/>disconnect watcher]
         H --> R[Router]
         R --> P{Policy<br/>cost / latency / rule / quality}
         P -->|ranked candidates =<br/>fallback chain| L[Fallback loop]
@@ -65,24 +65,29 @@ sequenceDiagram
 ### Project layout
 
 ```
-cmd/modelmux/         main: config, wiring, graceful shutdown
-cmd/loadtest/         three-phase load test (healthy / outage / recovery)
-internal/config/      YAML loading, defaults, validation
-internal/providers/   Provider interface, mock, Anthropic, OpenAI, error classification
-internal/router/      policies, latency tracker, fallback loop
-internal/resilience/  generic retry loop and circuit breaker (no HTTP or LLM knowledge)
-internal/metrics/     Prometheus collectors
-internal/logging/     request ID in context + slog handler
-internal/server/      HTTP handler, middleware, admin endpoint
-deploy/               Prometheus config
+src/modelmux/
+  __main__.py      entry point: config, wiring, uvicorn, graceful shutdown
+  config.py        YAML loading, defaults, validation (pydantic)
+  providers/       Provider interface, mock, Anthropic, OpenAI, error classification
+  router/          policies, latency tracker, fallback loop
+  resilience/      generic retry loop and circuit breaker (no HTTP or LLM knowledge)
+  server/          FastAPI app, request ID middleware, admin endpoint
+  metrics.py       Prometheus collectors
+  logs.py          JSON logging, request ID in a ContextVar
+  loadtest.py      three-phase load test (healthy / outage / recovery)
+tests/             pytest suite, no network or keys needed
+deploy/            Prometheus config
 ```
 
 ## Quick start
 
-Requires Go 1.26+ (or Docker only).
+Requires Python 3.12+ (or Docker only).
 
 ```bash
-go run ./cmd/modelmux                 # mock providers only, no keys needed
+python -m venv .venv
+source .venv/bin/activate          # Windows: .venv\Scripts\activate
+pip install -e ".[dev]"
+python -m modelmux                 # mock providers only, no keys needed
 ```
 
 ```bash
@@ -95,15 +100,15 @@ curl -s localhost:8080/v1/chat -d '{
 
 ```json
 {
-  "request_id": "3f602cab5bfc1cb9",
+  "request_id": "9d2cc6dc740d70ed",
   "provider": "mock-cheap",
   "model": "cheap-small",
   "routing_policy": "cost",
   "content": "[mock-cheap/cheap-small] mock reply to: \"Hello!\"",
-  "usage": { "input_tokens": 6, "output_tokens": 19 },
-  "estimated_cost_usd": 0.0000164,
-  "latency_ms": 97,
-  "attempts": [{ "provider": "mock-cheap", "model": "cheap-small", "duration_ms": 96 }]
+  "usage": { "input_tokens": 6, "output_tokens": 16 },
+  "estimated_cost_usd": 1.4e-05,
+  "latency_ms": 92,
+  "attempts": [{ "provider": "mock-cheap", "model": "cheap-small", "duration_ms": 91 }]
 }
 ```
 
@@ -122,7 +127,7 @@ docker compose up --build
 ```bash
 export ANTHROPIC_API_KEY=...
 export OPENAI_API_KEY=...
-go run ./cmd/modelmux -config config.real.yaml
+python -m modelmux --config config.real.yaml
 # or: MODELMUX_CONFIG=/etc/modelmux/config.real.yaml docker compose up --build
 ```
 
@@ -138,9 +143,11 @@ go run ./cmd/modelmux -config config.real.yaml
 | `max_tokens` | int | optional, defaults to `server.default_max_tokens` |
 | `routing_hint` | string | optional: `cheap`, `fast` or `quality` |
 
+Unknown fields are rejected, so a typo like `max_token` is a `400` instead of being silently ignored.
+
 Status codes: `200`; `400` invalid request; `422` no model's context window fits the prompt; `502` every provider failed; `504` request budget exhausted; `499` the client disconnected.
 
-Other endpoints: `GET /metrics`, `GET /healthz`, and `PATCH /admin/mocks/{name}` (only with `-admin`, see the load test below).
+Other endpoints: `GET /metrics`, `GET /healthz`, and `PATCH /admin/mocks/{name}` (only with `--admin`, see the load test below).
 
 ## Demo walkthrough
 
@@ -149,7 +156,7 @@ A 5-minute demo you can run live, with no API keys. The commands are bash: on Wi
 **1. Start the gateway and Prometheus.**
 
 ```bash
-docker compose up --build -d     # or, without Docker: go run ./cmd/modelmux -admin
+docker compose up --build -d     # or, without Docker: python -m modelmux --admin
 docker compose logs -f modelmux  # optional, in a second terminal: JSON logs with request IDs
 ```
 
@@ -164,9 +171,9 @@ done
 ```
 
 ```
-{"provider":"mock-cheap","model":"cheap-small","routing_policy":"cost","latency_ms":111}
-{"provider":"mock-flaky","model":"fast-medium","routing_policy":"latency","latency_ms":137}
-{"provider":"mock-premium","model":"premium-large","routing_policy":"quality","latency_ms":553}
+{"provider":"mock-cheap","model":"cheap-small","routing_policy":"cost","latency_ms":93}
+{"provider":"mock-flaky","model":"fast-medium","routing_policy":"latency","latency_ms":52}
+{"provider":"mock-premium","model":"premium-large","routing_policy":"quality","latency_ms":503}
 ```
 
 `mock-flaky` fails 30% of the time, so the `fast` request sometimes shows a retry in its `attempts`.
@@ -198,8 +205,8 @@ curl -s -w ' HTTP %{http_code}\n' localhost:8080/v1/chat \
 ```
 
 ```
-{"request_id":"4e73f02a0427c0cf","error":"messages must not be empty"} HTTP 400
-{"request_id":"81f5d23019e61e88","error":"no model can serve this request"} HTTP 422
+{"request_id":"74d82f6bcddd00a7","error":"messages: List should have at least 1 item after validation, not 0"} HTTP 400
+{"request_id":"3f7f354a9763a46f","error":"no model can serve this request"} HTTP 422
 ```
 
 No model has a 500K-token context window, so the second request gets a `422`.
@@ -231,7 +238,7 @@ chat
 chat; chat; chat
 ```
 
-The last line looks like this:
+The last lines look like this:
 
 ```
 {"provider":"mock-flaky","attempts":[{"provider":"mock-cheap","error":"mock-cheap: circuit breaker open"},{"provider":"mock-flaky","error":null}]}
@@ -246,10 +253,11 @@ curl -s localhost:8080/metrics | grep -E '^modelmux_(circuit_breaker_state|fallb
 ```
 
 ```
-modelmux_circuit_breaker_state{provider="mock-cheap"} 1
-modelmux_circuit_breaker_state{provider="mock-flaky"} 0
-modelmux_circuit_breaker_state{provider="mock-premium"} 0
-modelmux_fallbacks_total{model="cheap-small",provider="mock-cheap"} 5
+modelmux_fallbacks_total{model="cheap-small",provider="mock-cheap"} 4.0
+modelmux_fallbacks_total{model="fast-medium",provider="mock-flaky"} 1.0
+modelmux_circuit_breaker_state{provider="mock-cheap"} 1.0
+modelmux_circuit_breaker_state{provider="mock-flaky"} 0.0
+modelmux_circuit_breaker_state{provider="mock-premium"} 0.0
 ```
 
 Counters add up from when the gateway started, so after earlier runs your numbers will be higher.
@@ -270,13 +278,13 @@ sleep 11; chat
 **9. Under load.** The load test runs the same outage and recovery with 16 concurrent clients and prints throughput, error rate, p95 and breaker state every second. See [Load test](#load-test-fallback-and-circuit-breaking-under-failure) for real output.
 
 ```bash
-go run ./cmd/loadtest -phase 10s
+python -m modelmux.loadtest --phase 10s
 ```
 
 **10. Tests.**
 
 ```bash
-go test ./...
+pytest
 ```
 
 Stop everything with `docker compose down`.
@@ -309,11 +317,13 @@ routing:
       prefer: [mock-premium/premium-large]
 ```
 
-Policies are pure functions over the candidate list. They never call a provider, so each one is a few lines of code and is covered by table-driven tests.
+Policies are pure functions over the candidate list. They never call a provider, so each one is a few lines of code and is covered by parametrized tests.
 
 ## Reliability
 
-**Two time budgets.** `server.request_timeout` bounds the whole request, retries and fallbacks included. A provider's `attempt_timeout` bounds a single call. Both are `context.Context` deadlines. The attempt context is a child of the request context, so an attempt can never outlive the request. A client disconnect cancels everything downstream.
+**Two time budgets.** `server.request_timeout` bounds the whole request, retries and fallbacks included. A provider's `attempt_timeout` bounds a single call. The router wraps the whole fallback walk in `asyncio.timeout_at(deadline)` and each attempt in `asyncio.timeout(attempt_timeout)`, nested inside it, so an attempt can never outlive the request. The retry loop reads the same deadline, so it never starts a wait that would not fit.
+
+**Client disconnects cancel the work.** The handler runs the router in its own task, next to a second task that waits for the ASGI `http.disconnect` message. If the client goes away first, the router task is cancelled, and the cancellation reaches every in-flight upstream call. The request is logged and counted as `499`, not as a provider failure.
 
 **Retries only for retryable errors.**
 
@@ -339,7 +349,7 @@ stateDiagram-v2
 ```
 
 - Only *health* failures count: 5xx, 429, timeouts and network errors. A 400 or 401 means the provider answered, so it counts as healthy. A cancelled request gives no verdict and just frees the probe slot.
-- Half-open lets exactly one probe through at a time. A test checks this with 100 concurrent goroutines.
+- Half-open lets exactly one probe through at a time. On one event loop that holds by construction (the breaker never awaits), and the breaker also takes a lock, so it is safe from threads too. A test checks this with 100 threads released at the same moment.
 - The breaker is checked on *every attempt*, so a breaker that opens mid-retry also stops the remaining retries.
 
 ## Observability
@@ -377,61 +387,56 @@ sum by (provider) (rate(modelmux_fallbacks_total[5m]))
 Example `/metrics` output after the load test below (excerpt):
 
 ```
-modelmux_circuit_breaker_state{provider="mock-cheap"} 0
-modelmux_circuit_breaker_state{provider="mock-flaky"} 1
-modelmux_circuit_breaker_state{provider="mock-premium"} 0
-modelmux_estimated_cost_usd_total{model="cheap-small",provider="mock-cheap"} 0.0366150000000013
-modelmux_estimated_cost_usd_total{model="premium-large",provider="mock-premium"} 0.1804200000000024
-modelmux_fallbacks_total{model="cheap-small",provider="mock-cheap"} 707
-modelmux_fallbacks_total{model="fast-medium",provider="mock-flaky"} 636
-modelmux_retries_total{model="cheap-small",provider="mock-cheap"} 17
-modelmux_retries_total{model="fast-medium",provider="mock-flaky"} 46
-modelmux_tokens_total{direction="input",model="cheap-small",provider="mock-cheap"} 17087
-modelmux_upstream_request_duration_seconds_bucket{model="cheap-small",provider="mock-cheap",le="0.1"} 1242
-modelmux_upstream_request_duration_seconds_bucket{model="cheap-small",provider="mock-cheap",le="0.25"} 2490
-modelmux_upstream_requests_total{model="cheap-small",outcome="breaker_open",provider="mock-cheap"} 707
-modelmux_upstream_requests_total{model="cheap-small",outcome="error",provider="mock-cheap"} 17
-modelmux_upstream_requests_total{model="cheap-small",outcome="success",provider="mock-cheap"} 2441
-modelmux_upstream_requests_total{model="fast-medium",outcome="rate_limited",provider="mock-flaky"} 13
-modelmux_upstream_requests_total{model="premium-large",outcome="success",provider="mock-premium"} 620
+modelmux_upstream_requests_total{model="cheap-small",outcome="success",provider="mock-cheap"} 2092.0
+modelmux_upstream_requests_total{model="cheap-small",outcome="error",provider="mock-cheap"} 18.0
+modelmux_upstream_requests_total{model="cheap-small",outcome="breaker_open",provider="mock-cheap"} 669.0
+modelmux_upstream_requests_total{model="fast-medium",outcome="rate_limited",provider="mock-flaky"} 12.0
+modelmux_upstream_requests_total{model="fast-medium",outcome="breaker_open",provider="mock-flaky"} 636.0
+modelmux_upstream_requests_total{model="premium-large",outcome="success",provider="mock-premium"} 621.0
+modelmux_fallbacks_total{model="cheap-small",provider="mock-cheap"} 669.0
+modelmux_fallbacks_total{model="fast-medium",provider="mock-flaky"} 637.0
+modelmux_circuit_breaker_state{provider="mock-cheap"} 0.0
+modelmux_circuit_breaker_state{provider="mock-flaky"} 1.0
+modelmux_circuit_breaker_state{provider="mock-premium"} 0.0
 ```
 
-Logs are JSON, one line per event, and every line logged during a request carries its `request_id`. The ID is the caller's `X-Request-ID` if it is well-formed (≤ 64 safe characters), otherwise a new random one, and it is echoed back in the response header and body:
+Logs are JSON, one line per event. The request ID lives in a `ContextVar`, which asyncio copies into every task a request starts, so every line logged during a request carries its `request_id`. The ID is the caller's `X-Request-ID` if it is well-formed (≤ 64 safe characters), otherwise a new random one, and it is echoed back in the response header and body:
 
 ```json
-{"time":"2026-10-22T00:41:33.58Z","level":"INFO","msg":"chat request served","provider":"mock-cheap","model":"cheap-small","policy":"rule","attempts":1,"cost_usd":0.000017,"request_id":"3f602cab5bfc1cb9"}
-{"time":"2026-10-22T00:41:33.58Z","level":"WARN","msg":"circuit breaker state change","provider":"mock-cheap","from":"closed","to":"open"}
+{"time":"2026-10-29T03:11:12.200+00:00","level":"INFO","msg":"chat request served","provider":"mock-cheap","model":"cheap-small","policy":"rule","attempts":1,"cost_usd":1.3e-05,"request_id":"demo-123"}
+{"time":"2026-10-29T03:10:31.484+00:00","level":"WARNING","msg":"circuit breaker state change","provider":"mock-cheap","from":"closed","to":"open","request_id":"910db043e9db5a42"}
 ```
 
 ## Load test: fallback and circuit breaking under failure
 
-`cmd/loadtest` drives 16 concurrent clients through three phases. Between phases it uses the admin endpoint to switch the primary provider (`mock-cheap`) between healthy and a 100% error rate:
+`python -m modelmux.loadtest` drives 16 concurrent clients through three phases. Between phases it uses the admin endpoint to switch the primary provider (`mock-cheap`) between healthy and a 100% error rate:
 
 ```bash
-go run ./cmd/modelmux -admin      # or: docker compose up
-go run ./cmd/loadtest -phase 12s
+python -m modelmux --admin        # or: docker compose up
+python -m modelmux.loadtest --phase 12s
 ```
 
 Real output (trimmed):
 
 ```
 --- phase healthy: mock-cheap error_rate=0%
-[healthy ] t= 10s rps= 161 err=  0.0% p95= 118ms fallbacks=   0 breaker(mock-cheap)=closed    served: mock-cheap=161
+[healthy ] t= 10s rps= 143 err=  0.0% p95= 128ms fallbacks=   0 breaker(mock-cheap)=closed    served: mock-cheap=143
 --- phase outage: mock-cheap error_rate=100%
-[outage  ] t= 13s rps=  72 err=  0.0% p95= 481ms fallbacks=  72 breaker(mock-cheap)=open      served: mock-flaky=71 mock-premium=1
-[outage  ] t= 14s rps=  29 err=  0.0% p95= 1.05s fallbacks=  29 breaker(mock-cheap)=open      served: mock-premium=29
-[outage  ] t= 20s rps=  34 err=  0.0% p95= 575ms fallbacks=  34 breaker(mock-cheap)=open      served: mock-premium=34
+[outage  ] t= 13s rps=  29 err=  0.0% p95= 453ms fallbacks=  29 breaker(mock-cheap)=open      served: mock-flaky=29
+[outage  ] t= 14s rps=  31 err=  0.0% p95= 1.15s fallbacks=  31 breaker(mock-cheap)=open      served: mock-premium=31
+[outage  ] t= 20s rps=  30 err=  0.0% p95= 615ms fallbacks=  30 breaker(mock-cheap)=open      served: mock-premium=30
 --- phase recovery: mock-cheap error_rate=0%
-[recovery] t= 26s rps=  34 err=  0.0% p95= 592ms fallbacks=  34 breaker(mock-cheap)=open      served: mock-premium=34
-[recovery] t= 33s rps=  86 err=  0.0% p95= 581ms fallbacks=  27 breaker(mock-cheap)=closed    served: mock-cheap=59 mock-premium=27
-[recovery] t= 34s rps= 159 err=  0.0% p95= 119ms fallbacks=   0 breaker(mock-cheap)=closed    served: mock-cheap=159
+[recovery] t= 26s rps=  30 err=  0.0% p95= 592ms fallbacks=  30 breaker(mock-cheap)=open      served: mock-premium=30
+[recovery] t= 33s rps=  31 err=  0.0% p95= 609ms fallbacks=  30 breaker(mock-cheap)=closed    served: mock-cheap=1 mock-premium=30
+[recovery] t= 34s rps= 121 err=  0.0% p95= 529ms fallbacks=  13 breaker(mock-cheap)=closed    served: mock-cheap=108 mock-premium=13
+[recovery] t= 35s rps= 144 err=  0.0% p95= 130ms fallbacks=   0 breaker(mock-cheap)=closed    served: mock-cheap=144
 ```
 
 What it shows:
 
 - **Clients saw 0% errors through the whole outage.** Every request was served by a fallback.
 - **The breaker opened within the first second of the outage.** After that, `mock-cheap` was skipped with no network call (`breaker_open` in the metrics), instead of every request paying for 3 failing attempts plus backoff.
-- **`mock-flaky` (30% errors + 10% 429s) tripped its own breaker under load.** Traffic then settled on `mock-premium`. Throughput dropped because the slowest model (~400 ms) was the only healthy one left, but nothing failed.
+- **`mock-flaky` (30% errors + 10% 429s) tripped its own breaker under load.** Traffic then settled on `mock-premium`. Throughput dropped because the slowest model (~500 ms) was the only healthy one left, but nothing failed.
 - **Recovery is automatic.** Once `open_timeout` (10s) passed after the last failed probe, one probe succeeded, the breaker closed, and traffic returned to the cheap model within a second.
 
 ## Design trade-offs
@@ -439,27 +444,30 @@ What it shows:
 | Decision | Why | Cost |
 |---|---|---|
 | A policy *ranks* candidates and the ranking is the fallback chain | one concept instead of two configs that drift apart; policies are pure and testable | the order is fixed per request; no mid-request re-ranking |
+| asyncio on a single event loop | the gateway mostly waits on the network, and thousands of waiting tasks are cheap | CPU-heavy work on the loop stalls every request; scaling past one core means several worker processes, and then each one has its own breakers and latency stats |
 | Estimated tokens (chars/4), no tokenizer | no dependency, provider-agnostic, good enough for routing and context-window checks | cost estimates are approximate; billing should use the provider's reported usage (which the metrics do) |
 | Latency policy explores unmeasured providers first | avoids starving a provider that has never been tried | a few early requests go to a slow provider |
 | Retries never sleep past the deadline or a long `Retry-After` | the remaining budget is better spent on another provider | a provider that would have recovered in 10 s is skipped for this request |
 | Fall back on *any* provider error, not just retryable ones | a 401 or model-specific 400 at A says nothing about B | a genuinely bad request is sent to every provider (input is validated first to limit this) |
 | Consecutive-failure breaker | simple to reason about and test | at a high sustained error rate (see `mock-flaky` above) it trips readily; production would use a failure *rate* over a sliding window with a minimum request volume |
 | One breaker per provider, not per model | outages are usually provider-wide (auth, network, region) | one broken model takes its siblings out for `open_timeout` |
-| Plain `net/http` adapters instead of SDKs | minimal dependencies, full control of error classification and `Retry-After` | no streaming or tool use; those would need more API surface |
-| Dedicated Prometheus registry and nil-safe `*Metrics` | explicit, no global state, tests can create many gateways or skip metrics | slightly more wiring in `main` |
-| Unauthenticated admin endpoint behind a `-admin` flag | simplest way to inject failures for demos and load tests | must never be enabled in production |
+| Plain `httpx` adapters instead of SDKs | minimal dependencies, full control of error classification and `Retry-After` | no streaming or tool use; those would need more API surface |
+| Dedicated Prometheus registry | explicit, no global state, tests can create many gateways | slightly more wiring in `__main__` |
+| Unauthenticated admin endpoint behind an `--admin` flag | simplest way to inject failures for demos and load tests | must never be enabled in production |
 
 ## Testing
 
 ```bash
-go test ./...                     # unit + integration tests, no network or keys needed
-go vet ./...
-# race detector (needs cgo; on Windows without gcc, use Docker):
-docker run --rm -v "$PWD:/src" -w /src golang:1.27 go test -race ./...
+pytest                    # unit + integration tests, no network or keys needed
+ruff check .              # lint
+ruff format --check .     # formatting
 ```
 
-- **Unit tests:** every routing policy (table-driven), latency tracker, retry/backoff (deterministic jitter, Retry-After, deadline handling, cancellation), circuit breaker (fake clock, all transitions, concurrent probe), provider adapters against `httptest` servers, config validation.
-- **Integration test** (`internal/server/integration_test.go`): the full HTTP stack with mock A failing. The request falls back to B and succeeds, and the test asserts the attempt trail, request ID and `/metrics` counters. It also covers all-providers-fail, runtime outage and recovery through the admin endpoint, and request validation.
+CI runs all three on Python 3.12 and 3.14, plus a Docker build.
+
+- **Unit tests:** every routing policy (parametrized), latency tracker, retry/backoff (deterministic jitter, Retry-After, deadline handling, cancellation), circuit breaker (fake clock, all transitions, 100 concurrent threads on the probe), provider adapters against `httpx.MockTransport`, config validation.
+- **Router tests:** fallback after retries, attempt timeouts, long `Retry-After`, request budget, client cancellation, open breaker skipping a provider, and the metrics each of these records.
+- **Integration tests** (`tests/test_server.py`): the full ASGI app through `httpx.ASGITransport`. Mock A fails, the request falls back to B and succeeds, and the test asserts the attempt trail, request ID and `/metrics` counters. They also cover all-providers-fail, a runtime outage and recovery through the admin endpoint, and request validation.
 
 ## What I'd add next
 
@@ -467,5 +475,6 @@ docker run --rm -v "$PWD:/src" -w /src golang:1.27 go test -race ./...
 - A rate-based circuit breaker and per-provider concurrency limits (bulkheads)
 - Hedged requests for latency-critical traffic (send to a second provider after p95)
 - Token-bucket rate limiting per client, plus per-tenant budgets driven by the cost metrics
+- Shared breaker and latency state (e.g. Redis) so several worker processes act as one gateway
 - A real tokenizer per provider for accurate context-window checks
 - Config hot reload and authentication

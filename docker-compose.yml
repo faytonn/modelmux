@@ -16,9 +16,9 @@ services:
     environment:
       ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
       OPENAI_API_KEY: ${OPENAI_API_KEY:-}
-    # -admin enables PATCH /admin/mocks/{name} so the load test can inject an
+    # --admin enables PATCH /admin/mocks/{name} so the load test can inject an
     # outage. It is unauthenticated: this compose file is a local demo setup.
-    command: ["-config", "${MODELMUX_CONFIG:-/etc/modelmux/config.yaml}", "-admin"]
+    command: ["--config", "${MODELMUX_CONFIG:-/etc/modelmux/config.yaml}", "--admin"]
     restart: unless-stopped
 
   prometheus:
