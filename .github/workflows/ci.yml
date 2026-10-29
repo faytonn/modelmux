@@ -11,19 +11,23 @@ permissions:
 jobs:
   test:
     runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python-version: ["3.12", "3.14"]
     steps:
       - uses: actions/checkout@v5
-      - uses: actions/setup-go@v6
+      - uses: actions/setup-python@v6
         with:
-          go-version-file: go.mod
-      - name: gofmt
-        run: test -z "$(gofmt -l .)" || { gofmt -l .; exit 1; }
-      - name: go mod tidy
-        run: go mod tidy -diff
-      - name: go vet
-        run: go vet ./...
-      - name: go test (race)
-        run: go test -race -count=1 ./...
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+      - name: install
+        run: pip install -e ".[dev]"
+      - name: ruff format
+        run: ruff format --check .
+      - name: ruff check
+        run: ruff check .
+      - name: pytest
+        run: pytest
 
   docker:
     runs-on: ubuntu-latest

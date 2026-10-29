@@ -6,13 +6,17 @@
 *.key
 secrets/
 
-# Build output
-/bin/
-/modelmux
-/modelmux.exe
-*.exe
-*.test
-*.out
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+*.egg-info/
+build/
+dist/
+.pytest_cache/
+.ruff_cache/
+.coverage
 coverage.*
 
 # Editors / OS

@@ -2,7 +2,7 @@
 #
 #   export ANTHROPIC_API_KEY=...   # or put them in a local .env (git-ignored)
 #   export OPENAI_API_KEY=...
-#   go run ./cmd/modelmux -config config.real.yaml
+#   python -m modelmux --config config.real.yaml
 #
 # A provider whose key is missing is skipped at startup with a warning.
 # Model IDs, context windows and prices change over time: check each
